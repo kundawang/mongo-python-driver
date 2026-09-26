@@ -17,10 +17,14 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import time
+from unittest import mock
 
+from pymongo.asynchronous.auth import _canonicalize_hostname
+from pymongo.asynchronous.helpers import _getaddrinfo, _getnameinfo
 from pymongo.errors import ServerSelectionTimeoutError
-from test.asynchronous import AsyncIntegrationTest
+from test.asynchronous import AsyncIntegrationTest, AsyncUnitTest
 
 
 class TestClientLoopUnblocked(AsyncIntegrationTest):
@@ -55,3 +59,82 @@ class TestClientLoopUnblocked(AsyncIntegrationTest):
             1.0,
             "Background task was blocked from running",
         )
+
+
+class TestDNSResolutionLoopUnblocked(AsyncUnitTest):
+    """DNS resolution must be offloaded to an executor and not block the event loop."""
+
+    # How long the patched blocking socket calls sleep.
+    RESOLUTION_DELAY = 0.5
+    # Maximum tolerable latency for a background task while resolution runs.
+    MAX_LATENCY = 0.4
+
+    async def assert_loop_unblocked(self, awaitable):
+        """Run awaitable while a background task ticks; fail if the loop stalls."""
+        ticks = []
+
+        async def background_task():
+            try:
+                while True:
+                    await asyncio.sleep(0.05)
+                    ticks.append(time.monotonic())
+            except asyncio.CancelledError:
+                raise
+
+        task = asyncio.create_task(background_task())
+        try:
+            result = await awaitable
+            # Give the background task a chance to observe any stall that
+            # happened while the awaitable was running.
+            await asyncio.sleep(0.2)
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        self.assertGreaterEqual(len(ticks), 2, "Background task never ran")
+        gaps = [later - earlier for earlier, later in zip(ticks, ticks[1:])]
+        self.assertLessEqual(
+            max(gaps),
+            self.MAX_LATENCY,
+            "Background task was blocked from running during DNS resolution",
+        )
+        return result
+
+    def blocking_getaddrinfo(self, host, port, *args, **kwargs):
+        time.sleep(self.RESOLUTION_DELAY)
+        return [
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "canonical.example.com",
+                ("127.0.0.1", 27017),
+            )
+        ]
+
+    def blocking_getnameinfo(self, sockaddr, flags):
+        time.sleep(self.RESOLUTION_DELAY)
+        return ("reverse.example.com", "27017")
+
+    async def test_getaddrinfo_does_not_block_loop(self):
+        with mock.patch("socket.getaddrinfo", side_effect=self.blocking_getaddrinfo):
+            result = await self.assert_loop_unblocked(
+                _getaddrinfo("localhost", 27017, family=socket.AF_INET, type=socket.SOCK_STREAM)
+            )
+        self.assertEqual(result[0][4], ("127.0.0.1", 27017))
+
+    async def test_getnameinfo_does_not_block_loop(self):
+        with mock.patch("socket.getnameinfo", side_effect=self.blocking_getnameinfo):
+            result = await self.assert_loop_unblocked(
+                _getnameinfo(("127.0.0.1", 27017), socket.NI_NAMEREQD)
+            )
+        self.assertEqual(result, ("reverse.example.com", "27017"))
+
+    async def test_canonicalize_hostname_does_not_block_loop(self):
+        with mock.patch("socket.getaddrinfo", side_effect=self.blocking_getaddrinfo):
+            with mock.patch("socket.getnameinfo", side_effect=self.blocking_getnameinfo):
+                result = await self.assert_loop_unblocked(
+                    _canonicalize_hostname("example.com", "forwardAndReverse")
+                )
+        self.assertEqual(result, "reverse.example.com")
