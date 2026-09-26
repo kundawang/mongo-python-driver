@@ -662,7 +662,9 @@ class Pool:
     async def ready(self) -> None:
         # Take the lock to avoid the race condition described in PYTHON-2699.
         async with self.lock:
-            if self.state != PoolState.READY:
+            # CLOSED is terminal: a heartbeat completing after close() must
+            # not resurrect the pool.
+            if self.state not in (PoolState.READY, PoolState.CLOSED):
                 self.state = PoolState.READY
                 self._telemetry.pool_ready()
 
@@ -677,12 +679,14 @@ class Pool:
         service_id: Optional[ObjectId] = None,
         interrupt_connections: bool = False,
     ) -> None:
-        old_state = self.state
         async with self.size_cond:
             if self.closed:
                 return
+            # Read the state under the lock: a concurrent reset() or ready()
+            # may have changed it since this call started.
+            old_state = self.state
             if self.opts.pause_enabled and pause and not self.opts.load_balanced:
-                old_state, self.state = self.state, PoolState.PAUSED
+                self.state = PoolState.PAUSED
             self.gen.inc(service_id)
             newpid = os.getpid()
             if self.pid != newpid:

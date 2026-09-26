@@ -33,14 +33,15 @@ from pymongo import MongoClient, message, timeout
 from pymongo.errors import AutoReconnect, ConnectionFailure, DuplicateKeyError
 from pymongo.hello import HelloCompat
 from pymongo.lock import _create_lock
-from pymongo.monitoring import _EventListeners
+from pymongo.monitoring import PoolClearedEvent, PoolReadyEvent, _EventListeners
 from test.utils import flaky, get_pool, joinall
 
 sys.path[0:0] = [""]
 
+from pymongo.pool_shared import PoolState
 from pymongo.socket_checker import SocketChecker
 from pymongo.synchronous.pool import Pool, PoolOptions
-from test import IntegrationTest, client_context, unittest
+from test import IntegrationTest, UnitTest, client_context, unittest
 from test.helpers import ConcurrentRunner
 from test.utils_shared import CMAPListener, delay
 
@@ -774,6 +775,64 @@ class TestPoolMaxSize(_TestPoolingBase):
             # is sufficient right *now* to catch a semaphore leak. But that
             # seems error-prone, so check the message too.
             self.assertNotIn("waiting for socket from pool", str(context.exception))
+
+
+class TestPoolStateRaces(UnitTest):
+    """Regression tests for races between Pool._reset()/close() and ready().
+
+    Each test deterministically forces the losing interleaving of the race
+    instead of relying on timing.
+    """
+
+    def create_pool(self, listener):
+        return Pool(("localhost", 27017), PoolOptions(event_listeners=_EventListeners([listener])))
+
+    def test_ready_after_close_does_not_reopen_pool(self):
+        # A heartbeat that completes after close() calls ready() on the pool
+        # (via Topology.on_change); it must not resurrect the closed pool.
+        listener = CMAPListener()
+        pool = self.create_pool(listener)
+        pool.ready()
+        pool.close()
+        self.assertTrue(pool.closed)
+        listener.reset()
+
+        pool.ready()
+
+        self.assertTrue(pool.closed)
+        self.assertEqual(PoolState.CLOSED, pool.state)
+        self.assertEqual([], listener.events_by_type(PoolReadyEvent))
+        # reset() on a closed pool is a no-op as well.
+        pool.reset()
+        self.assertTrue(pool.closed)
+        self.assertEqual([], listener.events)
+
+    def test_reset_without_pause_observes_state_under_lock(self):
+        # _reset() must read the pool state while holding the lock. Force the
+        # interleaving where a concurrent reset() pauses the pool after
+        # reset_without_pause() started but before it acquired the lock.
+        listener = CMAPListener()
+        pool = self.create_pool(listener)
+        pool.ready()
+        listener.reset()
+
+        with pool.lock:
+            runner = ConcurrentRunner(target=pool.reset_without_pause)
+            runner.start()
+            # Wait for the runner to reach its lock acquisition.
+            time.sleep(0.5)
+            # Simulate a concurrent reset() pausing the pool first.
+            pool.state = PoolState.PAUSED
+        runner.join()
+
+        # The pool was already paused when the reset was applied, so no
+        # PoolClearedEvent may be published.
+        self.assertEqual([], listener.events_by_type(PoolClearedEvent))
+
+        # Sanity check: resetting a ready pool does publish PoolClearedEvent.
+        pool.state = PoolState.READY
+        pool.reset_without_pause()
+        self.assertEqual(1, listener.event_count(PoolClearedEvent))
 
 
 class TestPoolHandleConnectionError(unittest.TestCase):
