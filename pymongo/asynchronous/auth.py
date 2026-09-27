@@ -35,7 +35,7 @@ from pymongo.asynchronous.auth_oidc import (
     _authenticate_oidc,
     _OIDCAuthenticator,
 )
-from pymongo.asynchronous.helpers import _getaddrinfo
+from pymongo.asynchronous.helpers import _getaddrinfo, _getnameinfo
 from pymongo.auth_shared import (
     MongoCredential,
     _authenticate_scram_start,
@@ -185,7 +185,7 @@ async def _canonicalize_hostname(hostname: str, option: str | bool) -> str:
         return canonname.lower()
 
     try:
-        name = socket.getnameinfo(sockaddr, socket.NI_NAMEREQD)
+        name = await _getnameinfo(sockaddr, socket.NI_NAMEREQD)
     except socket.gaierror:
         return canonname.lower()
 

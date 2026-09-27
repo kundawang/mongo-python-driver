@@ -47,7 +47,7 @@ from pymongo.synchronous.auth_oidc import (
     _authenticate_oidc,
     _OIDCAuthenticator,
 )
-from pymongo.synchronous.helpers import _getaddrinfo
+from pymongo.synchronous.helpers import _getaddrinfo, _getnameinfo
 
 if TYPE_CHECKING:
     from pymongo.synchronous.pool import Connection
@@ -183,7 +183,7 @@ def _canonicalize_hostname(hostname: str, option: str | bool) -> str:
         return canonname.lower()
 
     try:
-        name = socket.getnameinfo(sockaddr, socket.NI_NAMEREQD)
+        name = _getnameinfo(sockaddr, socket.NI_NAMEREQD)
     except socket.gaierror:
         return canonname.lower()
 

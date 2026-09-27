@@ -94,6 +94,14 @@ async def _getaddrinfo(
         return socket.getaddrinfo(host, port, **kwargs)
 
 
+async def _getnameinfo(sockaddr: Any, flags: Any) -> tuple[str, str]:
+    if not _IS_SYNC:
+        loop = asyncio.get_running_loop()
+        return await loop.getnameinfo(sockaddr, flags)
+    else:
+        return socket.getnameinfo(sockaddr, flags)
+
+
 if sys.version_info >= (3, 10):
     anext = builtins.anext
     aiter = builtins.aiter

@@ -17,10 +17,14 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import time
+from unittest import mock
 
+from pymongo.asynchronous.auth import _canonicalize_hostname
+from pymongo.asynchronous.helpers import _getaddrinfo
 from pymongo.errors import ServerSelectionTimeoutError
-from test.asynchronous import AsyncIntegrationTest
+from test.asynchronous import AsyncIntegrationTest, AsyncUnitTest
 
 
 class TestClientLoopUnblocked(AsyncIntegrationTest):
@@ -55,3 +59,55 @@ class TestClientLoopUnblocked(AsyncIntegrationTest):
             1.0,
             "Background task was blocked from running",
         )
+
+
+class TestDNSResolutionLoopUnblocked(AsyncUnitTest):
+    async def _run_with_loop_monitor(self, awaitable):
+        latencies = []
+
+        # If the loop is being blocked, at least one iteration will have a
+        # latency much more than 0.05 seconds.
+        async def background_task():
+            try:
+                while True:
+                    start = time.monotonic()
+                    await asyncio.sleep(0.05)
+                    latencies.append(time.monotonic() - start)
+            except asyncio.CancelledError:
+                latencies.append(time.monotonic() - start)
+                raise
+
+        task = asyncio.create_task(background_task())
+        try:
+            await awaitable
+        finally:
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        return latencies
+
+    async def test_getaddrinfo_does_not_block_loop(self):
+        response = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 27017))]
+
+        def slow_getaddrinfo(*args, **kwargs):
+            # Simulate a slow DNS resolver.  Must not block the event loop.
+            time.sleep(0.75)
+            return response
+
+        with mock.patch("socket.getaddrinfo", side_effect=slow_getaddrinfo):
+            latencies = await self._run_with_loop_monitor(
+                _getaddrinfo("localhost", 27017, type=socket.SOCK_STREAM)
+            )
+
+        self.assertLessEqual(max(latencies), 0.5, "getaddrinfo blocked the event loop")
+
+    async def test_getnameinfo_does_not_block_loop(self):
+        def slow_getnameinfo(*args, **kwargs):
+            # Simulate a slow reverse DNS lookup.  Must not block the event loop.
+            time.sleep(0.75)
+            return ("localhost", "0")
+
+        with mock.patch("socket.getnameinfo", side_effect=slow_getnameinfo):
+            latencies = await self._run_with_loop_monitor(_canonicalize_hostname("localhost", True))
+
+        self.assertLessEqual(max(latencies), 0.5, "getnameinfo blocked the event loop")
