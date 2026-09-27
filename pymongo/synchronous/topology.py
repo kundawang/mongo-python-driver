@@ -48,8 +48,7 @@ from pymongo.errors import (
 )
 from pymongo.hello import Hello
 from pymongo.lock import (
-    _cond_wait,
-    _create_condition,
+    _Condition,
     _create_lock,
 )
 from pymongo.logger import _SERVER_SELECTION_LOGGER, _is_debug_enabled
@@ -131,7 +130,7 @@ class Topology:
         self._opened = False
         self._closed = False
         self._lock = _create_lock()
-        self._condition = _create_condition(
+        self._condition = _Condition(
             self._lock, self._settings.condition_class if _IS_SYNC else None
         )
         self._servers: dict[_Address, Server] = {}
@@ -309,7 +308,7 @@ class Topology:
             # change, or for a timeout. We won't miss any changes that
             # came after our most recent apply_selector call, since we've
             # held the lock until now.
-            _cond_wait(self._condition, common.MIN_HEARTBEAT_INTERVAL)
+            self._condition.wait(common.MIN_HEARTBEAT_INTERVAL)
             self._description.check_compatible()
             now = time.monotonic()
             server_descriptions = self._description.apply_selector(
@@ -575,7 +574,7 @@ class Topology:
         """Wake all monitors, wait for at least one to check its server."""
         with self._lock:
             self._request_check_all()
-            _cond_wait(self._condition, wait_time)
+            self._condition.wait(wait_time)
 
     def data_bearing_servers(self) -> list[ServerDescription]:
         """Return a list of all data-bearing servers.

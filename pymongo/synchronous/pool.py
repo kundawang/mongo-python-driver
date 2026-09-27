@@ -56,8 +56,7 @@ from pymongo.errors import (  # type:ignore[attr-defined]
 from pymongo.hello import Hello, HelloCompat
 from pymongo.helpers_shared import _get_timeout_details, format_timeout_details
 from pymongo.lock import (
-    _cond_wait,
-    _create_condition,
+    _Condition,
     _create_lock,
 )
 from pymongo.logger import _CONNECTION_LOGGER, _is_debug_enabled
@@ -611,7 +610,7 @@ class Pool:
         self.conns: collections.deque[Connection] = collections.deque()
         self.active_contexts: set[_CancellationContext] = set()
         self.lock = _create_lock()
-        self._max_connecting_cond = _create_condition(self.lock)
+        self._max_connecting_cond = _Condition(self.lock)
         self.active_sockets = 0
         # Monotonically increasing connection ID required for CMAP Events.
         self.next_connection_id = 1
@@ -630,7 +629,7 @@ class Pool:
         # The first portion of the wait queue.
         # Enforces: maxPoolSize
         # Also used for: clearing the wait queue
-        self.size_cond = _create_condition(self.lock)
+        self.size_cond = _Condition(self.lock)
         self.requests = 0
         self.max_pool_size = self.opts.max_pool_size
         if not self.max_pool_size:
@@ -638,7 +637,7 @@ class Pool:
         # The second portion of the wait queue.
         # Enforces: maxConnecting
         # Also used for: clearing the wait queue
-        self._max_connecting_cond = _create_condition(self.lock)
+        self._max_connecting_cond = _Condition(self.lock)
         self._pending = 0
         self._max_connecting = self.opts.max_connecting
         self._ssl_session_cache: Optional[list[Any]] = (
@@ -980,7 +979,7 @@ class Pool:
             self._raise_if_not_ready(checkout_started_time, emit_event=True)
             while not (self.requests < self.max_pool_size):
                 timeout = deadline - time.monotonic() if deadline else None
-                if not _cond_wait(self.size_cond, timeout):
+                if not self.size_cond.wait(timeout):
                     # Timed out, notify the next thread to ensure a
                     # timeout doesn't consume the condition.
                     if self.requests < self.max_pool_size:
@@ -1005,7 +1004,7 @@ class Pool:
                     self._raise_if_not_ready(checkout_started_time, emit_event=False)
                     while not (self.conns or self._pending < self._max_connecting):
                         timeout = deadline - time.monotonic() if deadline else None
-                        if not _cond_wait(self._max_connecting_cond, timeout):
+                        if not self._max_connecting_cond.wait(timeout):
                             # Timed out, notify the next thread to ensure a
                             # timeout doesn't consume the condition.
                             if self.conns or self._pending < self._max_connecting:

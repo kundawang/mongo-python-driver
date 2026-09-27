@@ -19,9 +19,171 @@ import asyncio
 import sys
 import unittest
 
-from pymongo.lock import _async_create_condition, _async_create_lock
+from pymongo.lock import _ACondition, _async_create_condition, _async_create_lock
 
 sys.path[0:0] = [""]
+
+
+class TestACondition(unittest.IsolatedAsyncioTestCase):
+    async def test_wait_notify(self):
+        cond = _ACondition()
+        result = []
+
+        async def waiter():
+            async with cond:
+                if await cond.wait():
+                    result.append(1)
+
+        task = asyncio.create_task(waiter())
+        await asyncio.sleep(0)
+        self.assertFalse(cond.locked())
+
+        async with cond:
+            cond.notify()
+        await asyncio.sleep(0)
+        await task
+        self.assertEqual([1], result)
+        self.assertFalse(cond.locked())
+
+    async def test_wait_timeout(self):
+        cond = _ACondition()
+        async with cond:
+            self.assertFalse(await cond.wait(0.01))
+            # The lock is re-acquired after a timeout.
+            self.assertTrue(cond.locked())
+
+    async def test_wait_unacquired(self):
+        cond = _ACondition()
+        with self.assertRaises(RuntimeError):
+            await cond.wait()
+
+    async def test_notify_unacquired(self):
+        cond = _ACondition()
+        with self.assertRaises(RuntimeError):
+            cond.notify()
+
+    async def test_context_manager(self):
+        cond = _ACondition()
+        self.assertFalse(cond.locked())
+        async with cond:
+            self.assertTrue(cond.locked())
+        self.assertFalse(cond.locked())
+
+    async def test_context_manager_releases_on_cancel(self):
+        cond = _ACondition()
+
+        async def waiter():
+            async with cond:
+                await cond.wait()
+
+        task = asyncio.create_task(waiter())
+        await asyncio.sleep(0)
+        self.assertFalse(cond.locked())
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        # The cancelled waiter re-acquired the lock before propagating
+        # CancelledError, and the context manager released it.
+        self.assertFalse(cond.locked())
+        self.assertFalse(cond._waiters)
+
+        # The lock is usable by other tasks afterwards.
+        async with cond:
+            self.assertTrue(cond.locked())
+
+    async def test_wait_cancel_reacquires_lock(self):
+        # A cancelled wait() re-acquires the lock before raising, even
+        # without a context manager.
+        cond = _ACondition()
+        await cond.acquire()
+
+        wait = asyncio.create_task(cond.wait())
+        await asyncio.sleep(0)
+        self.assertFalse(cond.locked())
+        wait.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await wait
+        self.assertFalse(cond._waiters)
+        # The cancelled task holds the lock again; release it.
+        self.assertTrue(cond.locked())
+        cond.release()
+        self.assertFalse(cond.locked())
+
+    async def test_cancelled_waiter_wakes_next(self):
+        # A notification consumed by a cancelled waiter is passed on to
+        # the next waiter instead of being lost.
+        cond = _ACondition()
+        result = []
+
+        async def waiter(i):
+            async with cond:
+                if await cond.wait():
+                    result.append(i)
+
+        t1 = asyncio.create_task(waiter(1))
+        t2 = asyncio.create_task(waiter(2))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        self.assertEqual(len(cond._waiters), 2)
+
+        # Notify t1, but cancel it before it can re-acquire the lock.
+        await cond.acquire()
+        cond.notify(1)
+        t1.cancel()
+        cond.release()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await t1
+        # t1's cancellation wakes t2, which completes normally.
+        await asyncio.wait_for(t2, 5)
+        self.assertEqual([2], result)
+        self.assertFalse(cond.locked())
+
+    async def test_cancelled_while_reacquiring(self):
+        # Cancellation delivered while re-acquiring the lock is retried
+        # until the lock is held, then re-raised.
+        cond = _ACondition()
+        await cond.acquire()
+
+        wait = asyncio.create_task(cond.wait())
+        await asyncio.sleep(0)
+        self.assertFalse(cond.locked())
+
+        # Re-acquire so we can notify and contest the lock.
+        await cond.acquire()
+        cond.notify()
+        await asyncio.sleep(0)
+        # The waiter is now blocked re-acquiring the lock; cancel it there.
+        wait.cancel()
+        cond.release()
+        with self.assertRaises(asyncio.CancelledError):
+            await wait
+        # The lock was still re-acquired before the CancelledError escaped.
+        self.assertTrue(cond.locked())
+        cond.release()
+
+    async def test_notify_all_with_cancelled_waiters(self):
+        cond = _ACondition()
+        result = []
+
+        async def waiter(i):
+            async with cond:
+                if await cond.wait():
+                    result.append(i)
+
+        tasks = [asyncio.create_task(waiter(i)) for i in range(3)]
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        tasks[0].cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await tasks[0]
+
+        async with cond:
+            cond.notify_all()
+        await asyncio.gather(*tasks[1:])
+        self.assertEqual(sorted(result), [1, 2])
+        self.assertFalse(cond.locked())
+
 
 if sys.version_info < (3, 13):
     # Tests adapted from: https://github.com/python/cpython/blob/v3.13.0rc2/Lib/test/test_asyncio/test_locks.py
